@@ -19,12 +19,20 @@ from utils.uiqm_postprocess_utils import enhance_rgb_float, preset_params
 
 
 class PromptIRModel(pl.LightningModule):
-    def __init__(self, water_aware=False, color_correction=False):
+    def __init__(
+        self,
+        water_aware=False,
+        color_correction=False,
+        frequency_refinement=False,
+        local_contrast_refinement=False,
+    ):
         super().__init__()
         self.net = PromptIR(
             decoder=True,
             water_aware=water_aware,
             color_correction=color_correction,
+            frequency_refinement=frequency_refinement,
+            local_contrast_refinement=local_contrast_refinement,
         )
         self.loss_fn = nn.L1Loss()
 
@@ -105,6 +113,8 @@ def main():
     parser.add_argument("--cuda", type=int, default=0)
     parser.add_argument("--water_aware", action="store_true")
     parser.add_argument("--color_correction", action="store_true")
+    parser.add_argument("--frequency_refinement", action="store_true")
+    parser.add_argument("--local_contrast_refinement", action="store_true")
     parser.add_argument("--tile", action="store_true")
     parser.add_argument("--tile_size", type=int, default=256)
     parser.add_argument("--tile_overlap", type=int, default=32)
@@ -128,6 +138,8 @@ def main():
         args.ckpt_path,
         water_aware=args.water_aware,
         color_correction=args.color_correction,
+        frequency_refinement=args.frequency_refinement,
+        local_contrast_refinement=args.local_contrast_refinement,
         strict=False,
     ).to(device)
     net.eval()

@@ -22,6 +22,7 @@ from utils.loss_utils import (
     ColorDistributionLoss,
     EdgeIntensityLoss,
     GradientStructureLoss,
+    HighFrequencyLoss,
     LocalContrastLoss,
 )
 from utils.schedulers import LinearWarmupCosineAnnealingLR
@@ -89,17 +90,24 @@ class WaterPromptIRModel(pl.LightningModule):
         lambda_color_dist=0.0,
         lambda_edge=0.0,
         lambda_local_contrast=0.0,
+        lambda_high_freq=0.0,
         lambda_consistency=0.0,
         jitter_brightness=0.15,
         jitter_contrast=0.15,
         jitter_saturation=0.15,
         color_correction=False,
+        frequency_refinement=False,
+        local_contrast_refinement=False,
         freeze_backbone=False,
     ):
         super().__init__()
         self.save_hyperparameters()
         self.net = PromptIR(
-            decoder=True, water_aware=True, color_correction=color_correction
+            decoder=True,
+            water_aware=True,
+            color_correction=color_correction,
+            frequency_refinement=frequency_refinement,
+            local_contrast_refinement=local_contrast_refinement,
         )
         self.rec_loss = nn.L1Loss()
         self.color_loss = ColorBalanceLoss()
@@ -107,6 +115,7 @@ class WaterPromptIRModel(pl.LightningModule):
         self.structure_loss = GradientStructureLoss()
         self.edge_loss = EdgeIntensityLoss()
         self.local_contrast_loss = LocalContrastLoss()
+        self.high_freq_loss = HighFrequencyLoss()
 
         if freeze_backbone:
             for name, param in self.net.named_parameters():
@@ -155,6 +164,7 @@ class WaterPromptIRModel(pl.LightningModule):
         structure_loss = self.structure_loss(restored, clean)
         edge_loss = self.edge_loss(restored, clean)
         local_contrast_loss = self.local_contrast_loss(restored, clean)
+        high_freq_loss = self.high_freq_loss(restored, clean)
         consistency_loss = restored.new_tensor(0.0)
         if self.hparams.lambda_consistency > 0:
             restored_aug = self.net(self._color_jitter(degraded))
@@ -166,6 +176,7 @@ class WaterPromptIRModel(pl.LightningModule):
             + self.hparams.lambda_structure * structure_loss
             + self.hparams.lambda_edge * edge_loss
             + self.hparams.lambda_local_contrast * local_contrast_loss
+            + self.hparams.lambda_high_freq * high_freq_loss
             + self.hparams.lambda_consistency * consistency_loss
         )
         self.log("train_loss", loss, prog_bar=True)
@@ -175,6 +186,7 @@ class WaterPromptIRModel(pl.LightningModule):
         self.log("train_structure_loss", structure_loss)
         self.log("train_edge_loss", edge_loss)
         self.log("train_local_contrast_loss", local_contrast_loss)
+        self.log("train_high_freq_loss", high_freq_loss)
         self.log("train_consistency_loss", consistency_loss)
         return loss
 
@@ -221,11 +233,14 @@ def main():
     parser.add_argument("--lambda_color_dist", type=float, default=0.0)
     parser.add_argument("--lambda_edge", type=float, default=0.0)
     parser.add_argument("--lambda_local_contrast", type=float, default=0.0)
+    parser.add_argument("--lambda_high_freq", type=float, default=0.0)
     parser.add_argument("--lambda_consistency", type=float, default=0.0)
     parser.add_argument("--jitter_brightness", type=float, default=0.15)
     parser.add_argument("--jitter_contrast", type=float, default=0.15)
     parser.add_argument("--jitter_saturation", type=float, default=0.15)
     parser.add_argument("--color_correction", action="store_true")
+    parser.add_argument("--frequency_refinement", action="store_true")
+    parser.add_argument("--local_contrast_refinement", action="store_true")
     parser.add_argument("--cuda", type=int, default=0)
     parser.add_argument("--freeze_backbone", action="store_true")
     args = parser.parse_args()
@@ -253,11 +268,14 @@ def main():
         lambda_color_dist=args.lambda_color_dist,
         lambda_edge=args.lambda_edge,
         lambda_local_contrast=args.lambda_local_contrast,
+        lambda_high_freq=args.lambda_high_freq,
         lambda_consistency=args.lambda_consistency,
         jitter_brightness=args.jitter_brightness,
         jitter_contrast=args.jitter_contrast,
         jitter_saturation=args.jitter_saturation,
         color_correction=args.color_correction,
+        frequency_refinement=args.frequency_refinement,
+        local_contrast_refinement=args.local_contrast_refinement,
         freeze_backbone=args.freeze_backbone,
     )
     if args.resume_ckpt is None:

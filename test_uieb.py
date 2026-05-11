@@ -21,9 +21,19 @@ from utils.val_utils import AverageMeter
 
 
 class PromptIRModel(pl.LightningModule):
-    def __init__(self, water_aware=False):
+    def __init__(
+        self,
+        water_aware=False,
+        frequency_refinement=False,
+        local_contrast_refinement=False,
+    ):
         super().__init__()
-        self.net = PromptIR(decoder=True, water_aware=water_aware)
+        self.net = PromptIR(
+            decoder=True,
+            water_aware=water_aware,
+            frequency_refinement=frequency_refinement,
+            local_contrast_refinement=local_contrast_refinement,
+        )
         self.loss_fn = nn.L1Loss()
 
     def forward(self, x):
@@ -117,6 +127,8 @@ def main():
     parser.add_argument("--output_path", type=str, default="output/uieb/")
     parser.add_argument("--ckpt_name", type=str, default="model.ckpt")
     parser.add_argument("--water_aware", action="store_true")
+    parser.add_argument("--frequency_refinement", action="store_true")
+    parser.add_argument("--local_contrast_refinement", action="store_true")
     parser.add_argument("--tile", action="store_true")
     parser.add_argument("--tile_size", type=int, default=256)
     parser.add_argument("--tile_overlap", type=int, default=32)
@@ -140,7 +152,11 @@ def main():
     print(f"UIEB target: {target_dir}")
 
     net = PromptIRModel.load_from_checkpoint(
-        ckpt_path, water_aware=opt.water_aware, strict=False
+        ckpt_path,
+        water_aware=opt.water_aware,
+        frequency_refinement=opt.frequency_refinement,
+        local_contrast_refinement=opt.local_contrast_refinement,
+        strict=False,
     ).to(device)
     net.eval()
 

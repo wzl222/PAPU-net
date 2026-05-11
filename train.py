@@ -19,10 +19,23 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 
 
 class PromptIRModel(pl.LightningModule):
-    def __init__(self, water_aware=False, lambda_color=0.0, lambda_structure=0.0, lr=2e-4):
+    def __init__(
+        self,
+        water_aware=False,
+        frequency_refinement=False,
+        local_contrast_refinement=False,
+        lambda_color=0.0,
+        lambda_structure=0.0,
+        lr=2e-4,
+    ):
         super().__init__()
         self.save_hyperparameters()
-        self.net = PromptIR(decoder=True, water_aware=water_aware)
+        self.net = PromptIR(
+            decoder=True,
+            water_aware=water_aware,
+            frequency_refinement=frequency_refinement,
+            local_contrast_refinement=local_contrast_refinement,
+        )
         self.loss_fn = nn.L1Loss()
         self.color_loss = ColorBalanceLoss()
         self.structure_loss = GradientStructureLoss()
@@ -81,6 +94,8 @@ def main():
     
     model = PromptIRModel(
         water_aware=opt.water_aware,
+        frequency_refinement=opt.frequency_refinement,
+        local_contrast_refinement=opt.local_contrast_refinement,
         lambda_color=opt.lambda_color,
         lambda_structure=opt.lambda_structure,
         lr=opt.lr,
@@ -100,5 +115,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-

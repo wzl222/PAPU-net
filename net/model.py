@@ -316,6 +316,93 @@ class ColorCorrectionHead(nn.Module):
         return restored + self.max_residual * residual
 
 
+class WaterAwareFrequencyRefinement(nn.Module):
+    def __init__(
+        self,
+        token_dim=128,
+        channels=3,
+        blur_kernel_size=5,
+        max_strength=0.2,
+        bias=False,
+    ):
+        super(WaterAwareFrequencyRefinement, self).__init__()
+        self.max_strength = max_strength
+        self.blur = nn.AvgPool2d(
+            kernel_size=blur_kernel_size,
+            stride=1,
+            padding=blur_kernel_size // 2,
+            count_include_pad=False,
+        )
+        self.high_freq_filter = nn.Sequential(
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                groups=channels,
+                bias=bias,
+            ),
+            nn.Conv2d(channels, channels, kernel_size=1, stride=1, padding=0, bias=bias),
+        )
+        self.to_alpha = nn.Sequential(
+            nn.Linear(token_dim, token_dim),
+            nn.GELU(),
+            nn.Linear(token_dim, channels),
+        )
+        nn.init.zeros_(self.to_alpha[-1].weight)
+        nn.init.zeros_(self.to_alpha[-1].bias)
+        nn.init.zeros_(self.high_freq_filter[-1].weight)
+        if self.high_freq_filter[-1].bias is not None:
+            nn.init.zeros_(self.high_freq_filter[-1].bias)
+
+    def forward(self, restored, water_token):
+        low_freq = self.blur(restored)
+        high_freq = restored - low_freq
+        high_freq = high_freq + self.high_freq_filter(high_freq)
+        alpha = torch.tanh(self.to_alpha(water_token)).unsqueeze(-1).unsqueeze(-1)
+        return restored + self.max_strength * alpha * high_freq
+
+
+class WaterAwareLocalContrastRefinement(nn.Module):
+    def __init__(
+        self,
+        token_dim=128,
+        kernel_size=9,
+        max_strength=0.2,
+    ):
+        super(WaterAwareLocalContrastRefinement, self).__init__()
+        self.max_strength = max_strength
+        self.local_mean = nn.AvgPool2d(
+            kernel_size=kernel_size,
+            stride=1,
+            padding=kernel_size // 2,
+            count_include_pad=False,
+        )
+        self.to_alpha = nn.Sequential(
+            nn.Linear(token_dim, token_dim),
+            nn.GELU(),
+            nn.Linear(token_dim, 1),
+        )
+        nn.init.zeros_(self.to_alpha[-1].weight)
+        nn.init.zeros_(self.to_alpha[-1].bias)
+
+    def forward(self, restored, water_token):
+        restored = restored.clamp(0.0, 1.0)
+        luminance = (
+            0.299 * restored[:, 0:1]
+            + 0.587 * restored[:, 1:2]
+            + 0.114 * restored[:, 2:3]
+        )
+        contrast_residual = luminance - self.local_mean(luminance)
+        alpha = torch.tanh(self.to_alpha(water_token)).unsqueeze(-1).unsqueeze(-1)
+        refined_luminance = luminance + self.max_strength * alpha * contrast_residual
+        luminance_safe = luminance.clamp_min(1e-4)
+        scale = refined_luminance / luminance_safe
+        refined = restored * scale
+        return refined.clamp(0.0, 1.0)
+
+
 
 
 ##########################################################################
@@ -336,6 +423,8 @@ class PromptIR(nn.Module):
         water_aware = False,
         water_token_dim = 128,
         color_correction = False,
+        frequency_refinement = False,
+        local_contrast_refinement = False,
     ):
 
         super(PromptIR, self).__init__()
@@ -346,6 +435,8 @@ class PromptIR(nn.Module):
         self.decoder = decoder
         self.water_aware = water_aware
         self.color_correction = color_correction
+        self.frequency_refinement = frequency_refinement
+        self.local_contrast_refinement = local_contrast_refinement
         
         if self.decoder:
             self.prompt1 = PromptGenBlock(prompt_dim=64,prompt_len=5,prompt_size = 64,lin_dim = 96)
@@ -361,6 +452,16 @@ class PromptIR(nn.Module):
             self.water_mod_dec3 = WaterAwareModulation(int(dim*2**2), water_token_dim)
             self.water_mod_dec2 = WaterAwareModulation(int(dim*2**1), water_token_dim)
             self.water_mod_dec1 = WaterAwareModulation(int(dim*2**1), water_token_dim)
+            if self.frequency_refinement:
+                self.frequency_refine = WaterAwareFrequencyRefinement(
+                    token_dim=water_token_dim,
+                    channels=out_channels,
+                    bias=bias,
+                )
+            if self.local_contrast_refinement:
+                self.local_contrast_refine = WaterAwareLocalContrastRefinement(
+                    token_dim=water_token_dim,
+                )
         
         
         self.chnl_reduce1 = nn.Conv2d(64,64,kernel_size=1,bias=bias)
@@ -487,6 +588,10 @@ class PromptIR(nn.Module):
 
 
         out_dec_level1 = self.output(out_dec_level1) + inp_img
+        if self.frequency_refinement and water_token is not None:
+            out_dec_level1 = self.frequency_refine(out_dec_level1, water_token)
+        if self.local_contrast_refinement and water_token is not None:
+            out_dec_level1 = self.local_contrast_refine(out_dec_level1, water_token)
         if self.color_correction:
             out_dec_level1 = self.color_head(out_dec_level1, inp_img)
 

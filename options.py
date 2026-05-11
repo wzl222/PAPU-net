@@ -10,6 +10,10 @@ parser.add_argument('--batch_size', type=int,default=8,help="Batch size to use p
 parser.add_argument('--lr', type=float, default=2e-4, help='learning rate of encoder.')
 parser.add_argument('--water_aware', action='store_true',
                     help='enable Water Token conditioning for underwater fine-tuning.')
+parser.add_argument('--frequency_refinement', action='store_true',
+                    help='enable water-token-guided frequency refinement for high-frequency structure recovery.')
+parser.add_argument('--local_contrast_refinement', action='store_true',
+                    help='enable water-token-guided local contrast refinement on the luminance structure.')
 parser.add_argument('--lambda_color', type=float, default=0.0,
                     help='weight for gray-world color balance loss.')
 parser.add_argument('--lambda_structure', type=float, default=0.0,

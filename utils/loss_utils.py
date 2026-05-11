@@ -122,3 +122,21 @@ class LocalContrastLoss(nn.Module):
 
     def forward(self, restored, target):
         return F.l1_loss(self._local_std(restored), self._local_std(target))
+
+
+class HighFrequencyLoss(nn.Module):
+    def __init__(self, kernel_size=5):
+        super(HighFrequencyLoss, self).__init__()
+        self.blur = nn.AvgPool2d(
+            kernel_size=kernel_size,
+            stride=1,
+            padding=kernel_size // 2,
+            count_include_pad=False,
+        )
+
+    def _high_freq(self, image):
+        image = image.clamp(0.0, 1.0)
+        return image - self.blur(image)
+
+    def forward(self, restored, target):
+        return F.l1_loss(self._high_freq(restored), self._high_freq(target))
