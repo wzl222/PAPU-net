@@ -25,11 +25,23 @@ class PromptIRModel(pl.LightningModule):
         color_correction=False,
         frequency_refinement=False,
         local_contrast_refinement=False,
+        prior_coupling=True,
+        disabled_priors=None,
+        prompt_conditioning=True,
+        modulation=True,
+        stage_specific_priors=True,
+        refinement_conditioning=True,
     ):
         super().__init__()
         self.net = PromptIR(
             decoder=True,
             water_aware=water_aware,
+            prior_coupling=prior_coupling,
+            disabled_priors=disabled_priors,
+            prompt_conditioning=prompt_conditioning,
+            modulation=modulation,
+            stage_specific_priors=stage_specific_priors,
+            refinement_conditioning=refinement_conditioning,
             color_correction=color_correction,
             frequency_refinement=frequency_refinement,
             local_contrast_refinement=local_contrast_refinement,
@@ -115,9 +127,26 @@ def main():
     parser.add_argument("--color_correction", action="store_true")
     parser.add_argument("--frequency_refinement", action="store_true")
     parser.add_argument("--local_contrast_refinement", action="store_true")
+    parser.add_argument(
+        "--disabled_priors",
+        nargs="*",
+        default=None,
+        choices=["color", "dcp", "luminance", "structure"],
+    )
+    parser.add_argument("--disable_prior_coupling", action="store_true")
+    parser.add_argument("--disable_prompt_conditioning", action="store_true")
+    parser.add_argument("--disable_modulation", action="store_true")
+    parser.add_argument("--shared_prior_token", action="store_true")
+    parser.add_argument("--disable_refinement_conditioning", action="store_true")
     parser.add_argument("--tile", action="store_true")
     parser.add_argument("--tile_size", type=int, default=256)
     parser.add_argument("--tile_overlap", type=int, default=32)
+    parser.add_argument("--quality_refinement", action="store_true")
+    parser.add_argument("--quality_preset", choices=["mild", "strong"], default=None)
+    parser.add_argument("--quality_clahe", type=float, default=0.0)
+    parser.add_argument("--quality_saturation", type=float, default=1.0)
+    parser.add_argument("--quality_contrast", type=float, default=1.0)
+    parser.add_argument("--quality_sharpness", type=float, default=0.0)
     parser.add_argument("--uiqm_postprocess", action="store_true")
     parser.add_argument("--uiqm_preset", choices=["mild", "strong"], default=None)
     parser.add_argument("--uiqm_clahe", type=float, default=0.0)
@@ -140,6 +169,12 @@ def main():
         color_correction=args.color_correction,
         frequency_refinement=args.frequency_refinement,
         local_contrast_refinement=args.local_contrast_refinement,
+        prior_coupling=not args.disable_prior_coupling,
+        disabled_priors=args.disabled_priors,
+        prompt_conditioning=not args.disable_prompt_conditioning,
+        modulation=not args.disable_modulation,
+        stage_specific_priors=not args.shared_prior_token,
+        refinement_conditioning=not args.disable_refinement_conditioning,
         strict=False,
     ).to(device)
     net.eval()
@@ -150,15 +185,17 @@ def main():
     print(f"Images: {len(dataset)}")
     print(f"Input: {args.input_dir}")
     print(f"Output: {args.output_path}")
-    if args.uiqm_postprocess:
-        params = preset_params(args.uiqm_preset) if args.uiqm_preset else {
-            "clahe": args.uiqm_clahe,
-            "saturation": args.uiqm_saturation,
-            "contrast": args.uiqm_contrast,
-            "sharpness": args.uiqm_sharpness,
+    use_quality_refinement = args.quality_refinement or args.uiqm_postprocess
+    if use_quality_refinement:
+        preset_name = args.quality_preset or args.uiqm_preset
+        params = preset_params(preset_name) if preset_name else {
+            "clahe": args.quality_clahe if args.quality_refinement else args.uiqm_clahe,
+            "saturation": args.quality_saturation if args.quality_refinement else args.uiqm_saturation,
+            "contrast": args.quality_contrast if args.quality_refinement else args.uiqm_contrast,
+            "sharpness": args.quality_sharpness if args.quality_refinement else args.uiqm_sharpness,
         }
         print(
-            "UIQM postprocess: "
+            "Quality refinement: "
             f"clahe={params['clahe']} saturation={params['saturation']} "
             f"contrast={params['contrast']} sharpness={params['sharpness']}"
         )
@@ -176,7 +213,7 @@ def main():
             else:
                 restored = net(degraded)
             restored = restored[:, :, :height, :width]
-            if args.uiqm_postprocess:
+            if use_quality_refinement:
                 restored = apply_uiqm_postprocess_batch(
                     restored,
                     params["clahe"],

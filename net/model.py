@@ -216,17 +216,30 @@ class OverlapPatchEmbed(nn.Module):
 ##########################################################################
 ##---------- Prompt Gen Module -----------------------
 class PromptGenBlock(nn.Module):
-    def __init__(self,prompt_dim=128,prompt_len=5,prompt_size = 96,lin_dim = 192):
+    def __init__(
+        self,
+        prompt_dim=128,
+        prompt_len=5,
+        prompt_size=96,
+        lin_dim=192,
+        cond_dim=0,
+    ):
         super(PromptGenBlock,self).__init__()
         self.prompt_param = nn.Parameter(torch.rand(1,prompt_len,prompt_dim,prompt_size,prompt_size))
         self.linear_layer = nn.Linear(lin_dim,prompt_len)
+        self.cond_layer = nn.Linear(cond_dim, prompt_len) if cond_dim > 0 else None
         self.conv3x3 = nn.Conv2d(prompt_dim,prompt_dim,kernel_size=3,stride=1,padding=1,bias=False)
-        
+        if self.cond_layer is not None:
+            nn.init.zeros_(self.cond_layer.weight)
+            nn.init.zeros_(self.cond_layer.bias)
 
-    def forward(self,x):
+    def forward(self, x, cond_token=None):
         B,C,H,W = x.shape
         emb = x.mean(dim=(-2,-1))
-        prompt_weights = F.softmax(self.linear_layer(emb),dim=1)
+        prompt_logits = self.linear_layer(emb)
+        if self.cond_layer is not None and cond_token is not None:
+            prompt_logits = prompt_logits + self.cond_layer(cond_token)
+        prompt_weights = F.softmax(prompt_logits,dim=1)
         prompt = prompt_weights.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) * self.prompt_param.unsqueeze(0).repeat(B,1,1,1,1,1).squeeze(1)
         prompt = torch.sum(prompt,dim=1)
         prompt = F.interpolate(prompt,(H,W),mode="bilinear")
@@ -239,8 +252,19 @@ class PromptGenBlock(nn.Module):
 ##########################################################################
 ##---------- Water-aware Modules -----------------------
 class WaterTokenEncoder(nn.Module):
-    def __init__(self, token_dim=128, stat_dim=10, hidden_dim=64, bias=False):
+    def __init__(
+        self,
+        token_dim=128,
+        stat_dim=10,
+        hidden_dim=64,
+        bias=False,
+        prior_coupling=True,
+        disabled_priors=None,
+    ):
         super(WaterTokenEncoder, self).__init__()
+        self.prior_coupling = prior_coupling
+        self.disabled_priors = set(disabled_priors or [])
+        self.prior_names = ("color", "dcp", "luminance", "structure")
         self.semantic_encoder = nn.Sequential(
             nn.Conv2d(3, hidden_dim, kernel_size=3, stride=2, padding=1, bias=bias),
             nn.GELU(),
@@ -248,13 +272,46 @@ class WaterTokenEncoder(nn.Module):
             nn.GELU(),
             nn.AdaptiveAvgPool2d(1),
         )
+        self.color_token = nn.Sequential(
+            nn.Linear(6, token_dim),
+            nn.GELU(),
+            nn.Linear(token_dim, token_dim),
+        )
+        self.dcp_token = nn.Sequential(
+            nn.Linear(3, token_dim),
+            nn.GELU(),
+            nn.Linear(token_dim, token_dim),
+        )
+        self.luminance_token = nn.Sequential(
+            nn.Linear(2, token_dim),
+            nn.GELU(),
+            nn.Linear(token_dim, token_dim),
+        )
+        self.structure_token = nn.Sequential(
+            nn.Linear(2, token_dim),
+            nn.GELU(),
+            nn.Linear(token_dim, token_dim),
+        )
+        self.prior_type_embedding = nn.Parameter(torch.zeros(1, 4, token_dim))
+        self.coupling_attention = nn.MultiheadAttention(
+            embed_dim=token_dim,
+            num_heads=4,
+            batch_first=True,
+        )
+        self.coupling_norm1 = nn.LayerNorm(token_dim)
+        self.coupling_norm2 = nn.LayerNorm(token_dim)
+        self.coupling_ffn = nn.Sequential(
+            nn.Linear(token_dim, token_dim * 2),
+            nn.GELU(),
+            nn.Linear(token_dim * 2, token_dim),
+        )
         self.mlp = nn.Sequential(
-            nn.Linear(token_dim + stat_dim, token_dim),
+            nn.Linear(token_dim * 3 + stat_dim, token_dim),
             nn.GELU(),
             nn.Linear(token_dim, token_dim),
         )
 
-    def _stats(self, x):
+    def _extract_priors(self, x):
         x = torch.clamp(x, 0, 1)
         channel_mean = x.mean(dim=(-2, -1))
         channel_std = x.std(dim=(-2, -1), unbiased=False)
@@ -264,18 +321,101 @@ class WaterTokenEncoder(nn.Module):
         dark = x.min(dim=1, keepdim=True).values
         dark_prior = -F.max_pool2d(-dark, kernel_size=15, stride=1, padding=7)
         turbidity = dark_prior.mean(dim=(-2, -1))
+        dark_p90 = torch.quantile(dark_prior.flatten(1), 0.9, dim=1, keepdim=True)
         grad_h = torch.abs(luminance[:, :, 1:, :] - luminance[:, :, :-1, :]).mean(dim=(-2, -1))
         grad_w = torch.abs(luminance[:, :, :, 1:] - luminance[:, :, :, :-1]).mean(dim=(-2, -1))
         sharpness = grad_h + grad_w
-        return torch.cat(
+        laplace = torch.abs(
+            -4.0 * luminance
+            + torch.roll(luminance, 1, dims=2)
+            + torch.roll(luminance, -1, dims=2)
+            + torch.roll(luminance, 1, dims=3)
+            + torch.roll(luminance, -1, dims=3)
+        ).mean(dim=(-2, -1))
+        color_stats = torch.cat([channel_mean, channel_std], dim=1)
+        dcp_stats = torch.cat(
+            [turbidity, dark_p90, dark_prior.std(dim=(-2, -1), unbiased=False)],
+            dim=1,
+        )
+        luminance_stats = torch.cat([luminance_mean, luminance_std], dim=1)
+        structure_stats = torch.cat([sharpness, laplace], dim=1)
+        all_stats = torch.cat(
             [channel_mean, channel_std, luminance_mean, luminance_std, turbidity, sharpness],
             dim=1,
         )
+        if self.disabled_priors:
+            all_stats = all_stats.clone()
+            if "color" in self.disabled_priors:
+                all_stats[:, 0:6] = 0.0
+            if "luminance" in self.disabled_priors:
+                all_stats[:, 6:8] = 0.0
+            if "dcp" in self.disabled_priors:
+                all_stats[:, 8:9] = 0.0
+            if "structure" in self.disabled_priors:
+                all_stats[:, 9:10] = 0.0
+        return color_stats, dcp_stats, luminance_stats, structure_stats, all_stats
+
+    def _apply_prior_mask(self, prior_tokens):
+        if not self.disabled_priors:
+            return prior_tokens
+        masked_tokens = prior_tokens.clone()
+        for idx, name in enumerate(self.prior_names):
+            if name in self.disabled_priors:
+                masked_tokens[:, idx] = 0.0
+        return masked_tokens
+
+    def _couple_prior_tokens(self, prior_tokens):
+        if not self.prior_coupling:
+            identity_attention = torch.eye(
+                prior_tokens.shape[1],
+                device=prior_tokens.device,
+                dtype=prior_tokens.dtype,
+            ).unsqueeze(0).expand(prior_tokens.shape[0], -1, -1)
+            return prior_tokens, identity_attention
+        prior_tokens = prior_tokens + self.prior_type_embedding
+        attn_input = self.coupling_norm1(prior_tokens)
+        attn_out, attn_weights = self.coupling_attention(
+            attn_input, attn_input, attn_input
+        )
+        prior_tokens = prior_tokens + attn_out
+        prior_tokens = prior_tokens + self.coupling_ffn(self.coupling_norm2(prior_tokens))
+        return prior_tokens, attn_weights
+
+    def _stats(self, x):
+        return self._extract_priors(x)[-1]
+
+    def encode(self, x):
+        semantic = self.semantic_encoder(x).flatten(1)
+        color_stats, dcp_stats, luminance_stats, structure_stats, stats = self._extract_priors(x)
+        prior_tokens = torch.stack(
+            [
+                self.color_token(color_stats),
+                self.dcp_token(dcp_stats),
+                self.luminance_token(luminance_stats),
+                self.structure_token(structure_stats),
+            ],
+            dim=1,
+        )
+        prior_tokens = self._apply_prior_mask(prior_tokens)
+        coupled_tokens, attn_weights = self._couple_prior_tokens(prior_tokens)
+        coupled_prior = coupled_tokens.mean(dim=1)
+        prompt_state = coupled_tokens.max(dim=1).values
+        final_token = self.mlp(torch.cat([semantic, coupled_prior, prompt_state, stats], dim=1))
+        return {
+            "final_token": final_token,
+            "semantic": semantic,
+            "stats": stats,
+            "color_token": coupled_tokens[:, 0],
+            "dcp_token": coupled_tokens[:, 1],
+            "luminance_token": coupled_tokens[:, 2],
+            "structure_token": coupled_tokens[:, 3],
+            "coupled_prior": coupled_prior,
+            "prompt_state": prompt_state,
+            "attention": attn_weights,
+        }
 
     def forward(self, x):
-        semantic = self.semantic_encoder(x).flatten(1)
-        stats = self._stats(x)
-        return self.mlp(torch.cat([semantic, stats], dim=1))
+        return self.encode(x)["final_token"]
 
 
 class WaterAwareModulation(nn.Module):
@@ -422,6 +562,12 @@ class PromptIR(nn.Module):
         decoder = False,
         water_aware = False,
         water_token_dim = 128,
+        prior_coupling = True,
+        disabled_priors = None,
+        prompt_conditioning = True,
+        modulation = True,
+        stage_specific_priors = True,
+        refinement_conditioning = True,
         color_correction = False,
         frequency_refinement = False,
         local_contrast_refinement = False,
@@ -434,17 +580,51 @@ class PromptIR(nn.Module):
         
         self.decoder = decoder
         self.water_aware = water_aware
+        self.prior_coupling = prior_coupling
+        self.prompt_conditioning = prompt_conditioning
+        self.modulation = modulation
+        self.stage_specific_priors = stage_specific_priors
+        self.refinement_conditioning = refinement_conditioning
         self.color_correction = color_correction
         self.frequency_refinement = frequency_refinement
         self.local_contrast_refinement = local_contrast_refinement
+        self.quality_refinement = False
         
         if self.decoder:
-            self.prompt1 = PromptGenBlock(prompt_dim=64,prompt_len=5,prompt_size = 64,lin_dim = 96)
-            self.prompt2 = PromptGenBlock(prompt_dim=128,prompt_len=5,prompt_size = 32,lin_dim = 192)
-            self.prompt3 = PromptGenBlock(prompt_dim=320,prompt_len=5,prompt_size = 16,lin_dim = 384)
+            prompt_cond_dim = (
+                water_token_dim
+                if self.water_aware and self.prompt_conditioning
+                else 0
+            )
+            self.prompt1 = PromptGenBlock(
+                prompt_dim=64,
+                prompt_len=5,
+                prompt_size=64,
+                lin_dim=96,
+                cond_dim=prompt_cond_dim,
+            )
+            self.prompt2 = PromptGenBlock(
+                prompt_dim=128,
+                prompt_len=5,
+                prompt_size=32,
+                lin_dim=192,
+                cond_dim=prompt_cond_dim,
+            )
+            self.prompt3 = PromptGenBlock(
+                prompt_dim=320,
+                prompt_len=5,
+                prompt_size=16,
+                lin_dim=384,
+                cond_dim=prompt_cond_dim,
+            )
 
         if self.water_aware:
-            self.water_encoder = WaterTokenEncoder(token_dim=water_token_dim, bias=bias)
+            self.water_encoder = WaterTokenEncoder(
+                token_dim=water_token_dim,
+                bias=bias,
+                prior_coupling=prior_coupling,
+                disabled_priors=disabled_priors,
+            )
             self.water_mod_level1 = WaterAwareModulation(dim, water_token_dim)
             self.water_mod_level2 = WaterAwareModulation(int(dim*2**1), water_token_dim)
             self.water_mod_level3 = WaterAwareModulation(int(dim*2**2), water_token_dim)
@@ -517,33 +697,91 @@ class PromptIR(nn.Module):
         if self.color_correction:
             self.color_head = ColorCorrectionHead(bias=bias)
 
+    @staticmethod
+    def _blend_tokens(*tokens):
+        valid_tokens = [token for token in tokens if token is not None]
+        if not valid_tokens:
+            return None
+        return torch.stack(valid_tokens, dim=0).mean(dim=0)
+
     def forward(self, inp_img,noise_emb = None):
-        water_token = self.water_encoder(inp_img) if self.water_aware else None
+        water_features = self.water_encoder.encode(inp_img) if self.water_aware else None
+        water_token = water_features["final_token"] if water_features is not None else None
+        shallow_token = None
+        mid_token = None
+        deep_token = None
+        prompt_token1 = None
+        prompt_token2 = None
+        prompt_token3 = None
+        if water_features is not None:
+            if self.stage_specific_priors:
+                shallow_token = self._blend_tokens(
+                    water_features["color_token"],
+                    water_features["luminance_token"],
+                    water_features["final_token"],
+                )
+                mid_token = self._blend_tokens(
+                    water_features["dcp_token"],
+                    water_features["luminance_token"],
+                    water_features["coupled_prior"],
+                )
+                deep_token = self._blend_tokens(
+                    water_features["structure_token"],
+                    water_features["coupled_prior"],
+                    water_features["prompt_state"],
+                )
+                prompt_token1 = self._blend_tokens(
+                    water_features["color_token"],
+                    water_features["luminance_token"],
+                    water_features["prompt_state"],
+                )
+                prompt_token2 = self._blend_tokens(
+                    water_features["dcp_token"],
+                    water_features["luminance_token"],
+                    water_features["coupled_prior"],
+                )
+                prompt_token3 = self._blend_tokens(
+                    water_features["structure_token"],
+                    water_features["coupled_prior"],
+                    water_features["final_token"],
+                )
+            else:
+                shared_token = water_features["final_token"]
+                shallow_token = shared_token
+                mid_token = shared_token
+                deep_token = shared_token
+                prompt_token1 = shared_token
+                prompt_token2 = shared_token
+                prompt_token3 = shared_token
+            if not self.prompt_conditioning:
+                prompt_token1 = None
+                prompt_token2 = None
+                prompt_token3 = None
 
         inp_enc_level1 = self.patch_embed(inp_img)
 
         out_enc_level1 = self.encoder_level1(inp_enc_level1)
-        if self.water_aware:
-            out_enc_level1 = self.water_mod_level1(out_enc_level1, water_token)
+        if self.water_aware and self.modulation:
+            out_enc_level1 = self.water_mod_level1(out_enc_level1, shallow_token)
         
         inp_enc_level2 = self.down1_2(out_enc_level1)
 
         out_enc_level2 = self.encoder_level2(inp_enc_level2)
-        if self.water_aware:
-            out_enc_level2 = self.water_mod_level2(out_enc_level2, water_token)
+        if self.water_aware and self.modulation:
+            out_enc_level2 = self.water_mod_level2(out_enc_level2, mid_token)
 
         inp_enc_level3 = self.down2_3(out_enc_level2)
 
         out_enc_level3 = self.encoder_level3(inp_enc_level3) 
-        if self.water_aware:
-            out_enc_level3 = self.water_mod_level3(out_enc_level3, water_token)
+        if self.water_aware and self.modulation:
+            out_enc_level3 = self.water_mod_level3(out_enc_level3, deep_token)
 
         inp_enc_level4 = self.down3_4(out_enc_level3)        
         latent = self.latent(inp_enc_level4)
-        if self.water_aware:
+        if self.water_aware and self.modulation:
             latent = self.water_mod_latent(latent, water_token)
         if self.decoder:
-            dec3_param = self.prompt3(latent)
+            dec3_param = self.prompt3(latent, prompt_token3)
 
             latent = torch.cat([latent, dec3_param], 1)
             latent = self.noise_level3(latent)
@@ -555,10 +793,10 @@ class PromptIR(nn.Module):
         inp_dec_level3 = self.reduce_chan_level3(inp_dec_level3)
 
         out_dec_level3 = self.decoder_level3(inp_dec_level3) 
-        if self.water_aware:
-            out_dec_level3 = self.water_mod_dec3(out_dec_level3, water_token)
+        if self.water_aware and self.modulation:
+            out_dec_level3 = self.water_mod_dec3(out_dec_level3, deep_token)
         if self.decoder:
-            dec2_param = self.prompt2(out_dec_level3)
+            dec2_param = self.prompt2(out_dec_level3, prompt_token2)
             out_dec_level3 = torch.cat([out_dec_level3, dec2_param], 1)
             out_dec_level3 = self.noise_level2(out_dec_level3)
             out_dec_level3 = self.reduce_noise_level2(out_dec_level3)
@@ -568,11 +806,11 @@ class PromptIR(nn.Module):
         inp_dec_level2 = self.reduce_chan_level2(inp_dec_level2)
 
         out_dec_level2 = self.decoder_level2(inp_dec_level2)
-        if self.water_aware:
-            out_dec_level2 = self.water_mod_dec2(out_dec_level2, water_token)
+        if self.water_aware and self.modulation:
+            out_dec_level2 = self.water_mod_dec2(out_dec_level2, mid_token)
         if self.decoder:
            
-            dec1_param = self.prompt1(out_dec_level2)
+            dec1_param = self.prompt1(out_dec_level2, prompt_token1)
             out_dec_level2 = torch.cat([out_dec_level2, dec1_param], 1)
             out_dec_level2 = self.noise_level1(out_dec_level2)
             out_dec_level2 = self.reduce_noise_level1(out_dec_level2)
@@ -583,14 +821,14 @@ class PromptIR(nn.Module):
         out_dec_level1 = self.decoder_level1(inp_dec_level1)
 
         out_dec_level1 = self.refinement(out_dec_level1)
-        if self.water_aware:
-            out_dec_level1 = self.water_mod_dec1(out_dec_level1, water_token)
+        if self.water_aware and self.modulation:
+            out_dec_level1 = self.water_mod_dec1(out_dec_level1, shallow_token)
 
 
         out_dec_level1 = self.output(out_dec_level1) + inp_img
-        if self.frequency_refinement and water_token is not None:
+        if self.frequency_refinement and water_token is not None and self.refinement_conditioning:
             out_dec_level1 = self.frequency_refine(out_dec_level1, water_token)
-        if self.local_contrast_refinement and water_token is not None:
+        if self.local_contrast_refinement and water_token is not None and self.refinement_conditioning:
             out_dec_level1 = self.local_contrast_refine(out_dec_level1, water_token)
         if self.color_correction:
             out_dec_level1 = self.color_head(out_dec_level1, inp_img)
